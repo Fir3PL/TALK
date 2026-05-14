@@ -83,16 +83,6 @@ TALK can be configured with CLI flags or environment variables.
 
 TALK gives an LLM access to a real local terminal. Run it only in environments where command execution is acceptable. Prefer a temporary test directory, a container, a disposable VM, or a restricted user account. Keep the web server bound to `127.0.0.1` unless you fully understand the risks.
 
-See [SECURITY.md](SECURITY.md) for more details.
-
-## Documentation
-
-- [Usage guide](docs/USAGE.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Prompt and tool contract](docs/PROMPTS.md)
-- [Contributing](CONTRIBUTING.md)
-- [Changelog](CHANGELOG.md)
-
 ## Project status
 
 This project is a compact experimental agent runtime. Expect backend compatibility differences across OpenAI-compatible providers, especially around streaming tool calls and reasoning/thinking fields.

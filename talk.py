@@ -1413,9 +1413,11 @@ class ToolArgParser:
                 out.append(candidate)
 
         add(s)
+        add(cls._escape_literal_newlines_in_strings(s))
         repaired = cls._replace_words_outside_strings(s, {"True": "true", "False": "false", "None": "null"})
         repaired = re.sub(r'([\{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)\s*:', lambda m: f'{m.group(1)}"{m.group(2)}":', repaired)
         add(repaired)
+        add(cls._escape_literal_newlines_in_strings(repaired))
 
         # Some backends/UIs can inject a truncation marker into streamed JSON as a
         # bare object key, for example: "_request_truncated_note..." without
@@ -1423,6 +1425,7 @@ class ToolArgParser:
         # so repair this known artifact before giving up on recovery.
         repaired = cls._repair_bare_request_marker_keys(repaired)
         add(repaired)
+        add(cls._repair_trailing_comma_object(repaired))
 
         repaired2 = re.sub(
             r':\s*([^\"\'\{\}\[\],][^,\}]*)',
@@ -1432,6 +1435,7 @@ class ToolArgParser:
         add(repaired2)
         repaired3 = cls._repair_bare_request_marker_keys(repaired2)
         add(repaired3)
+        add(cls._repair_trailing_comma_object(repaired3))
         return out
 
     @classmethod
@@ -1450,6 +1454,41 @@ class ToolArgParser:
         return ":" + json.dumps(raw, ensure_ascii=False)
 
     @staticmethod
+    def _escape_literal_newlines_in_strings(s: str) -> str:
+        out: List[str] = []
+        quote: Optional[str] = None
+        escape = False
+        changed = False
+        for ch in s:
+            if quote:
+                if escape:
+                    out.append(ch)
+                    escape = False
+                    continue
+                if ch == "\\":
+                    out.append(ch)
+                    escape = True
+                    continue
+                if ch == quote:
+                    out.append(ch)
+                    quote = None
+                    continue
+                if ch == "\n":
+                    out.append("\\n")
+                    changed = True
+                    continue
+                if ch == "\r":
+                    out.append("\\r")
+                    changed = True
+                    continue
+                out.append(ch)
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+            out.append(ch)
+        return "".join(out) if changed else s
+
+    @staticmethod
     def _repair_bare_request_marker_keys(s: str) -> str:
         # Known malformed payload pattern seen when a request-truncation note is
         # spliced into a JSON object as a key without a value. Keep it parseable;
@@ -1459,6 +1498,13 @@ class ToolArgParser:
             r'\1\2: true\3',
             s,
         )
+
+    @staticmethod
+    def _repair_trailing_comma_object(s: str) -> str:
+        stripped = str(s or "").strip()
+        if stripped.startswith("{") and stripped.endswith(","):
+            return stripped[:-1].rstrip() + "}"
+        return s
 
     @staticmethod
     def _replace_words_outside_strings(s: str, mapping: Dict[str, str]) -> str:
@@ -2524,7 +2570,15 @@ class TerminalAgent:
                                 "recovery_meta": recovery_meta,
                             }
                             await self.emit_llm("fake_tool_calls_recovered", warning_payload)
-                            if not recovery_meta.get("flm_inline_tool_calls_count"):
+                            if recovery_meta.get("flm_inline_tool_calls_count") and any("missing closing tag" in str(note) for note in recovery_meta.get("notes", [])):
+                                discipline_events.append(self._tool_discipline_event(
+                                    kind="malformed_inline_tool_call_recovered",
+                                    tool_name=str((recovered_tool_calls[0].get("function") or {}).get("name") or "unknown_tool") if recovered_tool_calls else "unknown_tool",
+                                    violation="You emitted an inline tool call without the closing <tool_call|> marker. The runtime recovered and executed it, but the format was malformed.",
+                                    correction="On the next inline tool action, emit exactly <|tool_call>call:tool_name{...}<tool_call|> and stop generating immediately after it.",
+                                    details={"recovered_count": len(recovered_tool_calls), "recovery_meta": recovery_meta},
+                                ))
+                            elif not recovery_meta.get("flm_inline_tool_calls_count"):
                                 discipline_events.append(self._tool_discipline_event(
                                     kind="fake_tool_call_recovered",
                                     tool_name=str((recovered_tool_calls[0].get("function") or {}).get("name") or "unknown_tool") if recovered_tool_calls else "unknown_tool",
@@ -3103,16 +3157,11 @@ class TerminalAgent:
         calls: List[Dict[str, Any]] = []
         if not text or "<|tool_call>" not in text:
             return calls, meta
-        pattern = re.compile(
-            r"<\|tool_call\>\s*call:([A-Za-z_][A-Za-z0-9_]*)\s*(\{.*?\})\s*<tool_call\|>",
-            flags=re.DOTALL,
-        )
-        for idx, match in enumerate(pattern.finditer(text)):
-            name = match.group(1).strip()
-            raw_args_text = match.group(2).strip()
+
+        def append_call(name: str, raw_args_text: str, idx: int, recovered_from: str) -> None:
             if name not in TOOL_ALLOWED_ARGS:
                 meta["notes"].append(f"ignored unknown inline tool: {name}")
-                continue
+                return
             repaired_args_text = cls._repair_flm_inline_arg_text(raw_args_text)
             parse_meta: Dict[str, Any] = {"parse_notes": [], "ignored_args": {}}
             parsed_args = ToolArgParser._parse_any(repaired_args_text, parse_meta)
@@ -3128,9 +3177,35 @@ class TerminalAgent:
             })
             notes = parse_meta.get("parse_notes", []) + normalize_meta.get("parse_notes", [])
             if notes:
-                meta["notes"].append(f"inline tool {name}: " + "; ".join(str(n) for n in notes))
+                meta["notes"].append(f"inline tool {name} ({recovered_from}): " + "; ".join(str(n) for n in notes))
             else:
-                meta["notes"].append(f"recovered inline tool {name}")
+                meta["notes"].append(f"recovered inline tool {name} ({recovered_from})")
+
+        pattern = re.compile(
+            r"<\|tool_call\>\s*call:([A-Za-z_][A-Za-z0-9_]*)\s*(\{.*?\})\s*<tool_call\|>",
+            flags=re.DOTALL,
+        )
+        for idx, match in enumerate(pattern.finditer(text)):
+            name = match.group(1).strip()
+            raw_args_text = match.group(2).strip()
+            append_call(name, raw_args_text, idx, "closed tag")
+        closed_count = len(calls)
+        open_pattern = re.compile(r"<\|tool_call\>\s*call:([A-Za-z_][A-Za-z0-9_]*)", flags=re.DOTALL)
+        for match in open_pattern.finditer(text):
+            name = match.group(1).strip()
+            if name not in TOOL_ALLOWED_ARGS:
+                meta["notes"].append(f"open inline tool {name}: waiting for complete/known tool name")
+                continue
+            suffix = text[match.end():]
+            next_open_idx = suffix.find("<|tool_call>")
+            close_idx = suffix.find("<tool_call|>")
+            if close_idx >= 0 and (next_open_idx < 0 or close_idx < next_open_idx):
+                continue
+            objects = cls._extract_tool_argument_objects_from_text(suffix, name, limit=1)
+            if not objects:
+                meta["notes"].append(f"open inline tool {name}: no recoverable JSON object")
+                continue
+            append_call(name, objects[0], closed_count + len(calls), "missing closing tag")
         meta["count"] = len(calls)
         return calls, meta
 
@@ -3179,6 +3254,50 @@ class TerminalAgent:
             if len(objects) >= limit:
                 break
         return sorted(set(objects), key=len, reverse=True)[:limit]
+
+    @classmethod
+    def _extract_tool_argument_objects_from_text(cls, text: str, tool_name: str, limit: int = 20) -> List[str]:
+        objects = cls._extract_json_objects_from_text(text, limit=max(limit, 10))
+        prefix = cls._extract_partial_object_prefix(text)
+        if prefix and prefix not in objects:
+            objects.append(prefix)
+        allowed = TOOL_ALLOWED_ARGS.get(tool_name) or set()
+        scored: List[Tuple[int, int, str]] = []
+        for obj in objects:
+            parse_meta: Dict[str, Any] = {"parse_notes": [], "ignored_args": {}}
+            parsed = ToolArgParser._parse_any(obj, parse_meta)
+            key_score = 0
+            if isinstance(parsed, dict):
+                key_score = sum(1 for key in parsed if key in allowed)
+            scored.append((key_score, len(obj), obj))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [obj for key_score, _length, obj in scored if key_score > 0][:limit] or [obj for _key_score, _length, obj in scored[:limit]]
+
+    @staticmethod
+    def _extract_partial_object_prefix(text: str) -> Optional[str]:
+        start = text.find("{")
+        if start < 0:
+            return None
+        quote: Optional[str] = None
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if quote:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in {'"', "'"}:
+                quote = ch
+                continue
+            if ch == ",":
+                tail = text[i + 1:].strip()
+                if not tail or tail.startswith("<|tool_call>") or tail.startswith("<tool_call|>"):
+                    return text[start:i].rstrip() + "}"
+        return None
 
     @staticmethod
     def _looks_like_fake_tool_call_content(content: str) -> bool:

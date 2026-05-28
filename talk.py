@@ -94,9 +94,9 @@ APP_FULL_NAME = "TALK — Terminal Agent Linux Kit"
 SYSTEM_PROMPT = """You are TALK — Terminal Agent Linux Kit. You share a Linux terminal with a human.
 
 Working rules:
-1. Complete the task by using NATIVE terminal tool calls.
+1. Complete the task by using the active tool-calling mode provided by TALK.
 2. If the task requires the terminal, use a tool. Do not merely describe what you would do.
-3. Before ANY terminal operation (terminal_read / terminal_send_text / terminal_send_keys / terminal_resize), call terminal_list_sessions first to confirm which sessions are idle or Working.
+3. Before ANY terminal operation (terminal_read / terminal_send_text / terminal_send_keys / terminal_resize), call terminal_list_sessions first to confirm which sessions are idle or Working. For a fresh terminal task, terminal_list_sessions is normally the first tool call.
 4. Working means a command or interactive application is active in that terminal. It can still receive control keys and app-specific commands when you target it with its session_id.
 5. Always use terminal_read first if you do not know the current terminal state of the chosen session.
 6. If session_id is not provided, pick an idle session for new shell commands. If all sessions are Working, create a new one with terminal_create_session or wait (sleep), then re-check with terminal_list_sessions.
@@ -112,7 +112,7 @@ Working rules:
 16. If the human types in the terminal, treat the visible terminal snapshot as shared work context.
 17. If you need the human, write a short text message and wait for the next message from the conversation panel.
 18. Be concise. The terminal sessions are the source of truth.
-19. Never stop after producing only private thinking/reasoning. If your analysis is not enough to finish, immediately choose and call the next useful native tool such as terminal_read, terminal_list_sessions, file_search, file_read, memory_search, sleep, or finish_task.
+19. Never stop after producing only private thinking/reasoning. If your analysis is not enough to finish, immediately choose and call the next useful tool such as terminal_list_sessions, terminal_read, file_search, file_read, memory_search, sleep, or finish_task.
 20. Do not output an ACTION/COMMAND block instead of a tool call. If you write or decide on a COMMAND, execute it with terminal_send_text in the appropriate session immediately.
 
 File tools protocol:
@@ -159,15 +159,19 @@ Non-repetition and context discipline:
 - When continuing a multi-step task, start from the newest tool result, newest memory, or newest user instruction, not from a full recap.
 
 Tool call contract:
-- Use only the API-native tool_calls mechanism, not Markdown, XML, or textual JSON blocks.
+- Use the active tool-calling mode provided by the runtime. In normal mode this is API-native tool_calls; in FLM inline mode emit exactly one <|tool_call>call:tool_name{...}<tool_call|> block.
 - Function arguments must be a single JSON object.
 - Do not use double braces such as {{...}}.
 - Do not use Python dict syntax.
+- Do not use XML/HTML-style parameter tags such as <param_value>, <text_value>, <newline_param_value>, or </...>.
 - Keys must be quoted.
 - Booleans must be JSON: true or false.
 - Do not add fields that are not in the schema.
+- terminal_send_text requires non-empty text. Put the shell command inside the JSON text value, never outside the argument object.
+- A bare tool name is not executable. Never emit only <|tool_call>call:terminal_send_text. If the command text is not fully formed yet, call terminal_list_sessions or terminal_read instead.
 
 Correct examples:
+- terminal_list_sessions: {}
 - terminal_read: {"max_chars":6000}
 - terminal_read specific session: {"session_id":"session_2","max_chars":6000}
 - terminal_send_text: {"text":"ls -la /home/user","newline":true}
@@ -175,7 +179,6 @@ Correct examples:
 - terminal_send_keys: {"keys":["CTRL_C"]}
 - terminal_resize: {"cols":120,"rows":30}
 - terminal_create_session: {}
-- terminal_list_sessions: {}
 - terminal_switch_session: {"session_id":"session_2"}
 - terminal_close_session: {"session_id":"session_2"}
 - sleep: {"seconds":1}
@@ -200,10 +203,14 @@ Required inline format, exactly:
 Rules:
 - Emit at most ONE tool call per assistant turn.
 - If you decide that the next step is to read/search/run/wait/write something, do NOT describe that intention in prose. Emit the inline tool call immediately.
+- Emit the inline call only when the full JSON argument object is ready. A bare <|tool_call>call:tool_name prefix is invalid and will not run.
 - Do not output sentences like "I will now read ..." or "Next I will search ..." unless the task is genuinely complete or you need the human to clarify.
 - Do not invent <|tool_response>; the runtime will execute the tool and send the real tool result in the next request.
 - Do not continue reasoning after the inline tool call.
 - Use JSON-compatible arguments with quoted string values.
+- Do not use XML/HTML-style parameter tags such as <param_value>, <text_value>, <newline_param_value>, or </...>.
+- terminal_send_text must include non-empty "text"; put the full shell command inside the JSON text value, not before/after the object.
+- If you know you need terminal work but have not selected a session or command yet, call terminal_list_sessions{} first.
 - Use finish_task only after the user's task is actually complete, not after a plan or partial review.
 - Do not call finish_task immediately after terminal_send_text or terminal_send_keys. First call terminal_read for that session and verify the command/app result.
 - Always call terminal_list_sessions before choosing any terminal session to operate on.
@@ -212,10 +219,10 @@ Rules:
 - Use only these tool names: terminal_read, terminal_send_text, terminal_send_keys, terminal_resize, terminal_create_session, terminal_list_sessions, terminal_switch_session, terminal_close_session, sleep, file_search, file_read, file_write, memory_save, memory_search, memory_list, memory_forget, task_declare, task_mark_done, task_status, finish_task.
 
 Examples:
+<|tool_call>call:terminal_list_sessions{}<tool_call|>
 <|tool_call>call:terminal_read{"max_chars":6000}<tool_call|>
 <|tool_call>call:terminal_send_text{"text":"ls -la","newline":true}<tool_call|>
 <|tool_call>call:terminal_create_session{}<tool_call|>
-<|tool_call>call:terminal_list_sessions{}<tool_call|>
 <|tool_call>call:file_search{"query":"TODO","path":".","search_filenames":true,"search_contents":true}<tool_call|>
 <|tool_call>call:finish_task{"summary":"I completed the task."}<tool_call|>
 [/FLM INLINE TOOL MODE]"""
@@ -979,7 +986,7 @@ class PtyTerminal:
           user@host:~/dir$
           root@host:/dir#
           └─$
-          [~/pentest]
+          [~]
           └─#
         while allowing trailing spaces and terminal-mode sequences after the prompt.
         """
@@ -1041,11 +1048,19 @@ class TerminalSession:
         foreground = self.terminal.foreground_process()
         self.last_prompt_candidate = candidate[-300:]
         self.last_prompt_idle = bool(prompt_idle)
-        self.active_app = str(foreground.get("app") or ("shell" if prompt_idle else "unknown"))
-        self.active_command = str(foreground.get("command") or self.active_app)
-        self.active_pid = foreground.get("pid")
-        self.foreground_pgid = foreground.get("pgid")
-        self.active_is_shell = bool(foreground.get("is_shell"))
+        if prompt_idle:
+            shell_name = Path(str(self.terminal.shell or "shell")).name or "shell"
+            self.active_app = shell_name
+            self.active_command = str(self.terminal.shell or shell_name)
+            self.active_pid = proc.pid if proc else foreground.get("pid")
+            self.foreground_pgid = foreground.get("pgid")
+            self.active_is_shell = True
+        else:
+            self.active_app = str(foreground.get("app") or "unknown")
+            self.active_command = str(foreground.get("command") or self.active_app)
+            self.active_pid = foreground.get("pid")
+            self.foreground_pgid = foreground.get("pgid")
+            self.active_is_shell = bool(foreground.get("is_shell"))
         if not running or prompt_idle:
             self.busy = False
         elif self.active_app and not self.active_is_shell:
@@ -1287,6 +1302,7 @@ class ToolArgParser:
         if not isinstance(parsed, dict):
             meta["parse_notes"].append(f"arguments were {type(parsed).__name__}, coerced to empty object")
             parsed = {}
+        parsed = cls._sanitize_parsed_args(parsed, meta)
         normalized = cls._normalize(tool_name, parsed, meta)
         allowed = TOOL_ALLOWED_ARGS.get(tool_name)
         if allowed is not None:
@@ -1345,6 +1361,124 @@ class ToolArgParser:
         return {}
 
     @classmethod
+    def _sanitize_parsed_args(cls, args: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean model/tool-template markup that leaked into argument values.
+
+        Some OpenAI-compatible backends stream malformed tool templates such as
+        </param_value></text_value> inside otherwise parseable JSON arguments.
+        Keep the recoverable value (for example session_1) and merge any
+        explicit <text_value>...</text_value> style parameters into the dict.
+        """
+        out: Dict[str, Any] = {}
+        for key, value in args.items():
+            clean_key = cls._canonical_arg_key(str(key))
+            clean_value = cls._clean_arg_value(clean_key, value, meta)
+            if clean_value is not None:
+                out[clean_key] = clean_value
+            if isinstance(value, str) and "<" in value and ">" in value:
+                tagged = cls._parse_tagged_params(value, meta)
+                for tagged_key, tagged_value in tagged.items():
+                    if tagged_key not in out and tagged_value is not None:
+                        out[tagged_key] = tagged_value
+        return out
+
+    @staticmethod
+    def _canonical_arg_key(key: str) -> str:
+        key = str(key or "").strip().strip("<>/ ").lower().replace("-", "_")
+        for suffix in ("_param_value", "_value", "_param"):
+            if key.endswith(suffix):
+                key = key[: -len(suffix)]
+        aliases = {
+            "session": "session_id",
+            "sid": "session_id",
+            "cmd": "text",
+            "command": "text",
+            "input": "text",
+            "content": "text",
+            "enter": "newline",
+            "press_enter": "newline",
+            "submit": "newline",
+            "return": "newline",
+        }
+        return aliases.get(key, key)
+
+    @classmethod
+    def _clean_arg_value(cls, key: str, value: Any, meta: Dict[str, Any]) -> Any:
+        if not isinstance(value, str):
+            return value
+        raw = value
+        cleaned = cls._strip_tool_markup(raw).strip()
+        if cleaned != raw.strip():
+            meta.setdefault("parse_notes", []).append(f"removed tool-template markup from {key}")
+        if key == "session_id":
+            match = re.search(r"\bsession_\d+\b", cleaned or raw)
+            if match:
+                sid = match.group(0)
+                if sid != raw.strip():
+                    meta.setdefault("parse_notes", []).append(f"recovered clean session_id={sid}")
+                return sid
+            if "<" in raw or ">" in raw:
+                meta.setdefault("parse_notes", []).append("dropped invalid session_id containing tool-template markup")
+                return None
+        return cleaned
+
+    @staticmethod
+    def _strip_tool_markup(value: str) -> str:
+        text = str(value or "")
+        text = text.replace("<tool_call|>", "").replace("<tool_call|", "").replace("<|tool_call>", "")
+        text = re.sub(
+            r"</?(?:param|parameter|param_name|param_value|name|value|"
+            r"[A-Za-z_][A-Za-z0-9_]*(?:_param)?_value)[^>]*>",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return text.strip().strip('"').strip("'").strip()
+
+    @classmethod
+    def _parse_tagged_params(cls, text: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        source = str(text or "")
+        out: Dict[str, Any] = {}
+
+        def add(key: str, value: str, note: str) -> None:
+            canonical = cls._canonical_arg_key(key)
+            cleaned = cls._clean_arg_value(canonical, value, meta)
+            if cleaned is None or str(cleaned).strip() == "":
+                return
+            if canonical not in out:
+                out[canonical] = cleaned
+                meta.setdefault("parse_notes", []).append(note)
+
+        # <text_value>cmd</text_value> or <newline_param_value>true</param_value>
+        tag_pattern = re.compile(
+            r"<(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?:_param)?_value[^>]*>\s*"
+            r"(?P<value>.*?)\s*</(?:param_value|(?P=key)(?:_param)?_value)>",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        for match in tag_pattern.finditer(source):
+            add(match.group("key"), match.group("value"), f"recovered {match.group('key')} from tagged tool parameter")
+
+        # <param_name>text</param_name><param_value>cmd</param_value>
+        pair_pattern = re.compile(
+            r"<(?:param_name|name)[^>]*>\s*(?P<key>[A-Za-z_][A-Za-z0-9_\-]*)\s*</(?:param_name|name)>\s*"
+            r"<(?:param_value|value)[^>]*>\s*(?P<value>.*?)\s*</(?:param_value|value)>",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        for match in pair_pattern.finditer(source):
+            add(match.group("key"), match.group("value"), f"recovered {match.group('key')} from tagged name/value parameter")
+
+        # <param name="text">cmd</param>
+        attr_pattern = re.compile(
+            r"<(?:param|parameter)[^>]*\bname=[\"'](?P<key>[A-Za-z_][A-Za-z0-9_\-]*)[\"'][^>]*>"
+            r"\s*(?P<value>.*?)\s*</(?:param|parameter)>",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        for match in attr_pattern.finditer(source):
+            add(match.group("key"), match.group("value"), f"recovered {match.group('key')} from tagged attribute parameter")
+
+        return out
+
+    @classmethod
     def _candidate_strings(cls, s: str) -> List[str]:
         out: List[str] = []
         def add(x: str) -> None:
@@ -1372,6 +1506,9 @@ class ToolArgParser:
         match = re.search(r"\w+\s*\((.*)\)\s*$", s, flags=re.DOTALL)
         if match:
             add(match.group(1))
+        tagged = cls._parse_tagged_params(s, {"parse_notes": [], "ignored_args": {}})
+        if tagged:
+            add(json.dumps(tagged, ensure_ascii=False))
         return out
 
     @staticmethod
@@ -1761,6 +1898,7 @@ class TerminalAgent:
         if self.api_provider != "ollama":
             self.client = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key or "EMPTY")
         self.tool_call_names: Dict[str, str] = {}
+        self.tool_call_recovery_meta: Dict[str, Dict[str, Any]] = {}
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.lock = asyncio.Lock()
         self.running = False
@@ -2073,6 +2211,7 @@ class TerminalAgent:
         self.generation += 1
         self.finished = False
         self.pending_terminal_verifications.clear()
+        self.tool_call_recovery_meta.clear()
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         memory_count = self.memory.list_recent(1).get("total_memories", 0) if self.memory else 0
         payload = {"generation": self.generation, "message": "The LLM context has been cleared. The terminal and session memory remain unchanged.", "session_memory_items": memory_count}
@@ -2390,7 +2529,7 @@ class TerminalAgent:
             "No assistant action from that failed stream was committed to conversation history. "
             "This is not task completion and not a reason to call finish_task.\n"
             "Continue the same task from the latest terminal snapshot and session memory. "
-            "Use API-native tool_calls for the next concrete action: terminal_read when state may be incomplete, "
+            "Use the active tool-calling mode for the next concrete action: terminal_read when state may be incomplete, "
             "file_search/file_read when inspecting code, file_write for precise edits, sleep for commands still running, "
             "or finish_task only when the user's task is actually complete.\n"
             f"Remaining transient LLM error retries after this notice: {remaining}."
@@ -2556,6 +2695,7 @@ class TerminalAgent:
                             stream_payload["native_tool_calls_count"] = 0
                             stream_payload["tool_call_recovery"] = recovery_meta
                             stream_payload["content_replaced_in_history_after_recovery"] = True
+                            self._remember_recovered_tool_call_meta(recovered_tool_calls, recovery_meta)
                             # Keep the raw streamed content in the UI/log payload, but
                             # do not feed the textual fake tool_call back to the model
                             # as assistant content. The history should contain one
@@ -2583,7 +2723,7 @@ class TerminalAgent:
                                     kind="fake_tool_call_recovered",
                                     tool_name=str((recovered_tool_calls[0].get("function") or {}).get("name") or "unknown_tool") if recovered_tool_calls else "unknown_tool",
                                     violation="You returned tool_calls as assistant content instead of API-native tool_calls. The runtime recovered it, but this is still a tool-call contract violation.",
-                                    correction="On the next action, call the tool through the API-native tool_calls field only; leave assistant content empty/null for tool calls.",
+                                    correction="On the next action, use the active tool-calling mode correctly: API-native tool_calls in normal mode, or exact FLM inline format in inline mode.",
                                     details={"recovered_count": len(recovered_tool_calls), "recovery_meta": recovery_meta},
                                 ))
 
@@ -2592,6 +2732,9 @@ class TerminalAgent:
                         history_msg["content"] = ""
                     self.messages.append(history_msg)
                     await self.emit_llm("assistant", stream_payload)
+
+                    self._remember_recovered_tool_call_meta(tool_calls, stream_payload.get("inline_tool_call_recovery") or {})
+                    self._remember_recovered_tool_call_meta(tool_calls, stream_payload.get("tool_call_recovery") or {})
 
                     if not tool_calls:
                         no_visible_content = not content.strip()
@@ -2602,8 +2745,8 @@ class TerminalAgent:
                             event = self._tool_discipline_event(
                                 kind="malformed_fake_tool_call",
                                 tool_name="unknown_tool",
-                                violation="You wrote JSON-like textual tool_calls, but the runtime could not recover executable native tool_calls from it.",
-                                correction="Do not stop. Re-issue the same intended action now using the API-native tool_calls mechanism only. Do not put tool_calls JSON in assistant content.",
+                                violation="You wrote JSON-like textual tool_calls, but the runtime could not recover executable tool_calls from it.",
+                                correction="Do not stop. Re-issue the same intended action now using the active tool-calling mode. In FLM inline mode, emit exactly one <|tool_call>call:tool_name{...}<tool_call|> block.",
                                 details={"content_preview": content[:1000], "recovery_meta": recovery_meta},
                             )
                             nudge = self._build_tool_discipline_feedback([event])
@@ -2621,8 +2764,8 @@ class TerminalAgent:
                             thinking_only_retries_left -= 1
                             nudge = (
                                 "Your previous response contained private thinking/reasoning but no visible answer and no tool_calls. "
-                                "Do not stop after analysis. Inspect the latest terminal/tool state and convert your analysis into the next native tool call. "
-                                "Call terminal_read if the terminal state may be incomplete, file_search if you need to locate files/references, file_read if file contents are needed, file_write with start_line/end_line for precise code edits, memory_search if saved context is needed, sleep if a command may still be running, or finish_task if the task is complete."
+                                "Do not stop after analysis. Inspect the latest terminal/tool state and convert your analysis into the next valid tool call for the active mode. "
+                                "Call terminal_list_sessions before selecting a terminal session, terminal_read if terminal state may be incomplete, file_search/file_read for files, memory_search for saved context, sleep if a command may still be running, or finish_task only when the task is complete."
                             )
                             self.messages.append({"role": "user", "content": nudge})
                             await self.emit_llm("thinking_only_retry", {
@@ -2637,7 +2780,7 @@ class TerminalAgent:
                             empty_retries_left -= 1
                             nudge = (
                                 "Your previous response was empty and did not contain tool_calls. "
-                                "You must use native tool calling. If you do not know what to do, call terminal_read; if you need to locate files/references, call file_search; if you need file contents, call file_read; if you are editing code, use file_write with start_line/end_line for precise replacements when possible. "
+                                "Use the active tool-calling mode. If you do not know what to do, call terminal_list_sessions or terminal_read; if you need files, call file_search/file_read; if you are editing code, use file_write with start_line/end_line for precise replacements when possible. "
                                 "If the task is finished, call finish_task."
                             )
                             self.messages.append({"role": "user", "content": nudge})
@@ -2844,34 +2987,88 @@ class TerminalAgent:
 
     async def _open_stream(self, request_messages: List[Dict[str, Any]]) -> Any:
         if self.api_provider == "ollama":
+            if self._ollama_base_url_is_openai_compat():
+                await self.emit_llm("ollama_openai_compat_mode", {
+                    "base_url": self.cfg.base_url,
+                    "openai_base_url": self._ollama_openai_base_url(),
+                    "reason": "Configured Ollama base_url already points at /v1, so TALK is using Ollama's OpenAI-compatible endpoint instead of native /api/chat.",
+                })
+                return await self._open_ollama_openai_compat_stream(request_messages, reason="base_url_points_to_v1")
             return self._open_ollama_stream(request_messages)
         return await self._open_openai_stream(request_messages)
 
     async def _open_openai_stream(self, request_messages: List[Dict[str, Any]]) -> Any:
         if self.client is None:
             raise RuntimeError("OpenAI-compatible client is not initialized for this provider")
+        return await self._open_openai_compatible_stream(
+            request_messages,
+            client=self.client,
+            extra_body=self._extra_body(),
+            include_tools=not self._use_flm_inline_tools(),
+            tool_choice=self.cfg.tool_choice,
+            provider_label="openai",
+        )
+
+    @staticmethod
+    def _openai_compatible_request_messages(request_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return messages containing only OpenAI-compatible chat fields."""
+        out: List[Dict[str, Any]] = []
+        for msg in request_messages:
+            if not isinstance(msg, dict):
+                continue
+            item: Dict[str, Any] = {
+                "role": str(msg.get("role") or "user"),
+                "content": msg.get("content"),
+            }
+            if item["content"] is None and item["role"] != "assistant":
+                item["content"] = ""
+            if msg.get("tool_call_id"):
+                item["tool_call_id"] = str(msg.get("tool_call_id"))
+            if msg.get("name"):
+                item["name"] = str(msg.get("name"))
+            if msg.get("tool_calls"):
+                item["tool_calls"] = to_jsonable(msg.get("tool_calls"))
+            out.append(item)
+        return out
+
+    async def _open_openai_compatible_stream(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        client: Optional[AsyncOpenAI] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
+        include_tools: bool = True,
+        tool_choice: Optional[str] = None,
+        provider_label: str = "openai",
+    ) -> Any:
+        chat_client = client or AsyncOpenAI(base_url=base_url, api_key=api_key or "EMPTY")
         kwargs: Dict[str, Any] = {
             "model": self.cfg.model,
-            "messages": request_messages,
+            "messages": self._openai_compatible_request_messages(request_messages),
             "temperature": self.cfg.temperature,
             "stream": True,
         }
-        if not self._use_flm_inline_tools():
+        if include_tools:
             kwargs["tools"] = TOOLS
-        extra_body = self._extra_body()
         if extra_body:
             kwargs["extra_body"] = extra_body
-        if (not self._use_flm_inline_tools()) and self.cfg.tool_choice != "omit":
-            kwargs["tool_choice"] = self.cfg.tool_choice
+        if include_tools and (tool_choice or "auto") != "omit":
+            kwargs["tool_choice"] = tool_choice or "auto"
         try:
-            return await self.client.chat.completions.create(**kwargs)
+            return await chat_client.chat.completions.create(**kwargs)
         except Exception as exc:
             if self._is_context_length_error(exc):
                 raise
             if kwargs.get("tool_choice") == "required":
-                await self.emit_llm("tool_choice_retry", {"reason": "backend rejected tool_choice=required", "error": repr(exc)})
+                await self.emit_llm("tool_choice_retry", {
+                    "provider": provider_label,
+                    "reason": "backend rejected tool_choice=required",
+                    "error": repr(exc),
+                })
                 kwargs["tool_choice"] = "auto"
-                return await self.client.chat.completions.create(**kwargs)
+                return await chat_client.chat.completions.create(**kwargs)
             raise
 
     def _ollama_chat_url(self) -> str:
@@ -2880,13 +3077,54 @@ class TerminalAgent:
         if not parsed.scheme or not parsed.netloc:
             return raw + "/api/chat"
         path = parsed.path.rstrip("/")
-        if path.endswith("/api/chat"):
+        if path.endswith("/v1"):
+            new_path = path[: -len("/v1")] + "/api/chat"
+        elif path.endswith("/api/chat"):
             new_path = path
         elif path.endswith("/api"):
             new_path = path + "/chat"
         else:
             new_path = path + "/api/chat"
         return urlunparse(parsed._replace(path=new_path, params="", query="", fragment=""))
+
+    def _ollama_base_url_is_openai_compat(self) -> bool:
+        raw = (self.cfg.base_url or "").rstrip("/")
+        parsed = urlparse(raw)
+        return bool(parsed.scheme and parsed.netloc and parsed.path.rstrip("/").endswith("/v1"))
+
+    def _ollama_openai_base_url(self) -> str:
+        raw = (self.cfg.base_url or "http://127.0.0.1:11434").rstrip("/")
+        parsed = urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.rstrip("/") + "/v1"
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1"):
+            new_path = path
+        elif path.endswith("/api/chat"):
+            new_path = path[: -len("/api/chat")] + "/v1"
+        elif path.endswith("/api"):
+            new_path = path[: -len("/api")] + "/v1"
+        else:
+            new_path = path + "/v1"
+        return urlunparse(parsed._replace(path=new_path, params="", query="", fragment=""))
+
+    async def _open_ollama_openai_compat_stream(self, request_messages: List[Dict[str, Any]], reason: str) -> Any:
+        base_url = self._ollama_openai_base_url()
+        await self.emit_llm("ollama_openai_compat_fallback", {
+            "reason": reason,
+            "native_url": self._ollama_chat_url(),
+            "openai_base_url": base_url,
+            "hint": "If this also fails with 404, the service at base_url is probably not Ollama or does not expose Ollama's OpenAI-compatible /v1 API.",
+        })
+        return await self._open_openai_compatible_stream(
+            request_messages,
+            base_url=base_url,
+            api_key=self.cfg.api_key or "ollama",
+            extra_body={},
+            include_tools=True,
+            tool_choice=self.cfg.tool_choice,
+            provider_label="ollama-openai-compat",
+        )
 
     def _ollama_think_value(self) -> Any:
         effort = (self.cfg.reasoning_effort or "none").strip().lower()
@@ -3001,7 +3239,26 @@ class TerminalAgent:
             final_usage: Dict[str, Any] = {}
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    response.raise_for_status()
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response is not None and exc.response.status_code == 404:
+                            await self.emit_llm("ollama_native_api_not_found", {
+                                "native_url": url,
+                                "status_code": 404,
+                                "error": repr(exc),
+                                "action": "Retrying through Ollama/OpenAI-compatible /v1/chat/completions.",
+                                "likely_causes": [
+                                    "base_url points to an OpenAI-compatible server, not native Ollama",
+                                    "Ollama is behind a proxy that exposes /v1 but not /api/chat",
+                                    "the host/port is not the Ollama service",
+                                ],
+                            })
+                            fallback_stream = await self._open_ollama_openai_compat_stream(request_messages, reason="native_api_chat_404")
+                            async for fallback_chunk in fallback_stream:
+                                yield fallback_chunk
+                            return
+                        raise
                     async for line in response.aiter_lines():
                         if not line.strip():
                             continue
@@ -3110,6 +3367,9 @@ class TerminalAgent:
             meta["flm_inline_tool_calls_count"] = len(flm_inline_calls)
             meta["flm_inline_tool_calls"] = flm_inline_calls
             meta["notes"].extend(flm_inline_meta.get("notes", []))
+        elif "<|tool_call>" in text:
+            meta["flm_inline_tool_calls_count"] = 0
+            meta["notes"].extend(flm_inline_meta.get("notes", []))
         parse_meta: Dict[str, Any] = {"parse_notes": [], "ignored_args": {}}
         parsed = ToolArgParser._parse_any(text, parse_meta)
         if parsed:
@@ -3153,7 +3413,7 @@ class TerminalAgent:
 
     @classmethod
     def _extract_flm_inline_tool_calls(cls, text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        meta: Dict[str, Any] = {"source": "fastflowlm_inline_tool_call", "notes": []}
+        meta: Dict[str, Any] = {"source": "fastflowlm_inline_tool_call", "notes": [], "source_text": text, "call_recovery": {}}
         calls: List[Dict[str, Any]] = []
         if not text or "<|tool_call>" not in text:
             return calls, meta
@@ -3169,9 +3429,18 @@ class TerminalAgent:
                 meta["notes"].append(f"inline tool {name}: arguments were not an object; using empty arguments")
                 parsed_args = {}
             normalized_args, normalize_meta = ToolArgParser.parse_and_normalize(name, parsed_args)
+            if (
+                name == "terminal_send_text"
+                and str(normalized_args.get("text") or "").strip()
+                and "newline" not in parsed_args
+                and recovered_from != "closed tag"
+            ):
+                normalized_args["newline"] = True
+                normalize_meta.setdefault("parse_notes", []).append("inferred newline=true for recovered shell command")
             raw_arguments = json.dumps(normalized_args, ensure_ascii=False, default=str)
+            call_id = f"flm_inline_call_{int(time.time() * 1000)}_{idx}"
             calls.append({
-                "id": f"flm_inline_call_{int(time.time() * 1000)}_{idx}",
+                "id": call_id,
                 "type": "function",
                 "function": {"name": name, "arguments": raw_arguments},
             })
@@ -3180,6 +3449,15 @@ class TerminalAgent:
                 meta["notes"].append(f"inline tool {name} ({recovered_from}): " + "; ".join(str(n) for n in notes))
             else:
                 meta["notes"].append(f"recovered inline tool {name} ({recovered_from})")
+            meta.setdefault("call_recovery", {})[call_id] = {
+                "source": "fastflowlm_inline_tool_call",
+                "source_text": text,
+                "tool_name": name,
+                "raw_inline_args": raw_args_text,
+                "normalized_args": normalized_args,
+                "recovered_from": recovered_from,
+                "recovery_notes": notes,
+            }
 
         pattern = re.compile(
             r"<\|tool_call\>\s*call:([A-Za-z_][A-Za-z0-9_]*)\s*(\{.*?\})\s*<tool_call\|>",
@@ -3203,6 +3481,14 @@ class TerminalAgent:
                 continue
             objects = cls._extract_tool_argument_objects_from_text(suffix, name, limit=1)
             if not objects:
+                if name == "terminal_send_text":
+                    probe_meta = {"source_text": text, "raw_inline_args": suffix.strip()}
+                    candidates = cls._recover_terminal_send_text_candidates(probe_meta, suffix)
+                    if candidates:
+                        append_call(name, suffix.strip(), closed_count + len(calls), "missing argument object")
+                    else:
+                        meta["notes"].append("open inline terminal_send_text: missing JSON arguments and no unambiguous command text; not executed")
+                    continue
                 meta["notes"].append(f"open inline tool {name}: no recoverable JSON object")
                 continue
             append_call(name, objects[0], closed_count + len(calls), "missing closing tag")
@@ -3258,10 +3544,10 @@ class TerminalAgent:
     @classmethod
     def _extract_tool_argument_objects_from_text(cls, text: str, tool_name: str, limit: int = 20) -> List[str]:
         objects = cls._extract_json_objects_from_text(text, limit=max(limit, 10))
-        prefix = cls._extract_partial_object_prefix(text)
+        allowed = TOOL_ALLOWED_ARGS.get(tool_name) or set()
+        prefix = cls._extract_partial_object_prefix(text, allowed)
         if prefix and prefix not in objects:
             objects.append(prefix)
-        allowed = TOOL_ALLOWED_ARGS.get(tool_name) or set()
         scored: List[Tuple[int, int, str]] = []
         for obj in objects:
             parse_meta: Dict[str, Any] = {"parse_notes": [], "ignored_args": {}}
@@ -3274,7 +3560,7 @@ class TerminalAgent:
         return [obj for key_score, _length, obj in scored if key_score > 0][:limit] or [obj for _key_score, _length, obj in scored[:limit]]
 
     @staticmethod
-    def _extract_partial_object_prefix(text: str) -> Optional[str]:
+    def _extract_partial_object_prefix(text: str, allowed_keys: Optional[Set[str]] = None) -> Optional[str]:
         start = text.find("{")
         if start < 0:
             return None
@@ -3294,9 +3580,13 @@ class TerminalAgent:
                 quote = ch
                 continue
             if ch == ",":
-                tail = text[i + 1:].strip()
-                if not tail or tail.startswith("<|tool_call>") or tail.startswith("<tool_call|>"):
-                    return text[start:i].rstrip() + "}"
+                candidate = text[start:i].rstrip() + "}"
+                parse_meta: Dict[str, Any] = {"parse_notes": [], "ignored_args": {}}
+                parsed = ToolArgParser._parse_any(candidate, parse_meta)
+                if isinstance(parsed, dict):
+                    keys = set(parsed.keys())
+                    if not allowed_keys or keys.intersection(allowed_keys):
+                        return candidate
         return None
 
     @staticmethod
@@ -3397,7 +3687,7 @@ class TerminalAgent:
                 "Execute that exact command now with terminal_send_text in the correct session.\n"
             )
         if self._use_flm_inline_tools():
-            example_command = command or "cd pentest_192.168.0.32_20260526173949"
+            example_command = command or "ls -lia"
             return (
                 "[runtime_continuation_required]\n"
                 "Your previous response described the next step but did not execute it. This is not task completion. "
@@ -3413,7 +3703,7 @@ class TerminalAgent:
             )
         return (
             "Your previous response described the next step but did not execute it. This is not task completion. "
-            "Do not output ACTION/COMMAND prose without tool_calls. Use a native tool call now for the action you described, "
+            "Do not output ACTION/COMMAND prose without tool_calls. Use the active tool-calling mode now for the action you described, "
             "or call finish_task only if the user's task is actually complete."
             f"{command_hint}\nPrevious non-executed response preview:\n{preview}"
         )
@@ -3431,7 +3721,7 @@ class TerminalAgent:
             )
         return (
             "Your previous assistant message had no executable tool_calls and did not clearly finish the task. "
-            "Continue working with a native tool call now. Prefer terminal_read, terminal_list_sessions, terminal_send_text, "
+            "Continue working with the active tool-calling mode now. Prefer terminal_list_sessions, terminal_read, terminal_send_text, "
             "file_search, file_read, sleep, or finish_task only when the task is actually complete.\n"
             f"Previous message preview:\n{preview}"
         )
@@ -3507,9 +3797,9 @@ class TerminalAgent:
     def _build_tool_discipline_feedback(self, events: List[Dict[str, Any]]) -> str:
         lines = [
             "[tool_discipline]",
-            "NEGATIVE FEEDBACK / TOOL-CALL CONTRACT VIOLATION.",
-            "This is a runtime penalty signal: the previous tool call behavior was wrong and must not be repeated.",
-            "You do not receive credit for textual/fake/malformed tool calls. Use the API-native tool_calls mechanism only.",
+            "CORRECTIVE TOOL-CALL FEEDBACK.",
+            "The runtime may repair and execute recoverable tool-call mistakes, but the next tool call should use the correct format.",
+            "Use the active tool mode: API-native tool_calls in normal mode, or the exact FLM inline format when FLM inline mode is active.",
             "For the next action, correct the behavior immediately while continuing the task.",
         ]
         for idx, event in enumerate(events, start=1):
@@ -3522,12 +3812,16 @@ class TerminalAgent:
                 lines.append(f"Details {idx}: {json.dumps(to_jsonable(details), ensure_ascii=False, default=str)[:1200]}")
         lines.extend([
             "Hard rules now:",
-            "- Do not write tool_calls as JSON/text/Markdown in assistant content.",
+            "- In FLM inline mode, emit exactly one <|tool_call>call:tool_name{...}<tool_call|> block and stop.",
+            "- In normal tool mode, use API-native tool_calls and keep assistant content empty/null for tool calls.",
             "- Tool arguments must be exactly one valid JSON object, with quoted keys, JSON booleans/null, and no comments or debug/truncation artifacts.",
+            "- Do not use XML/HTML parameter tags such as <param_value>, <text_value>, <newline_param_value>, or closing tag fragments.",
+            "- terminal_send_text requires a non-empty text argument; put the command inside the JSON text value.",
+            "- A bare tool prefix such as <|tool_call>call:terminal_send_text is incomplete; use terminal_list_sessions/terminal_read until you have a complete command.",
             "- Do not include unknown keys. Do not include request-truncation notes or parser artifacts.",
             "- Required arguments must be present and non-empty.",
             "- Do not call finish_task after terminal actions until terminal_read verifies the resulting output.",
-            "- If unsure, call terminal_read or file_search as a native tool call; if complete, call finish_task as a native tool call.",
+            "- If unsure, call terminal_list_sessions, terminal_read, or file_search using the active tool mode; if complete, call finish_task.",
             "[/tool_discipline]",
         ])
         return "\n".join(lines)
@@ -3558,18 +3852,156 @@ class TerminalAgent:
             "feedback": feedback,
         })
 
+    def _remember_recovered_tool_call_meta(self, tool_calls: List[Dict[str, Any]], recovery_meta: Dict[str, Any]) -> None:
+        call_recovery = recovery_meta.get("call_recovery") if isinstance(recovery_meta, dict) else None
+        if not isinstance(call_recovery, dict):
+            return
+        for tc in tool_calls or []:
+            call_id = str(tc.get("id") or "")
+            if call_id and isinstance(call_recovery.get(call_id), dict):
+                self.tool_call_recovery_meta[call_id] = dict(call_recovery[call_id])
+
+    @staticmethod
+    def _looks_like_shell_command_text(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        if re.match(r"(?i)^(terminal session|the terminal|i need|i will|let me|next i|now i|assistant|thinking)\b", stripped):
+            return False
+        if "\n" in stripped:
+            return True
+        first = stripped.split(None, 1)[0]
+        if first[:1].isupper() and not any(ch in first for ch in "./:-_"):
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9_./:-]+", first)) and not stripped.startswith(("{", "[", "<|"))
+
+    @classmethod
+    def _extract_bare_terminal_command_from_inline_tail(cls, text: str) -> Optional[str]:
+        value = str(text or "")
+        if not value.strip():
+            return None
+        match = re.search(r"<\|tool_call\>\s*call:terminal_send_text", value, flags=re.DOTALL)
+        if match:
+            value = value[match.end():]
+        for marker in ("<tool_call|>", "<|tool_call>"):
+            marker_idx = value.find(marker)
+            if marker_idx >= 0:
+                value = value[:marker_idx]
+        value = value.strip()
+        if not value or value.startswith(("{", "[", '"', "'")):
+            return None
+        line = next((line.strip() for line in value.splitlines() if line.strip()), "")
+        return line if cls._looks_like_shell_command_text(line) else None
+
+    @classmethod
+    def _recover_terminal_send_text_candidates(cls, recovery_meta: Dict[str, Any], raw_args: Any) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        def add(text: Any, source: str, newline: Optional[bool] = None) -> None:
+            value = str(text or "").strip()
+            if not value:
+                return
+            for existing in candidates:
+                if existing.get("text") == value:
+                    existing["source"] = f"{existing.get('source')},{source}"
+                    if newline is not None and "newline" not in existing:
+                        existing["newline"] = bool(newline)
+                    return
+            item = {"text": value, "source": source}
+            if newline is not None:
+                item["newline"] = bool(newline)
+            if item not in candidates:
+                candidates.append(item)
+
+        for source_name, source_value in (
+            ("raw_arguments", raw_args),
+            ("raw_inline_args", recovery_meta.get("raw_inline_args")),
+        ):
+            if source_value is None:
+                continue
+            parsed, _candidate_meta = ToolArgParser.parse_and_normalize("terminal_send_text", source_value)
+            if isinstance(parsed, dict) and str(parsed.get("text") or "").strip():
+                add(parsed.get("text"), source_name, parsed.get("newline") if "newline" in parsed else None)
+
+        for source_name, source_value in (
+            ("source_text", recovery_meta.get("source_text")),
+            ("raw_inline_args", recovery_meta.get("raw_inline_args")),
+            ("raw_arguments", raw_args),
+        ):
+            text = str(source_value or "")
+            if not text:
+                continue
+            for obj in cls._extract_tool_argument_objects_from_text(text, "terminal_send_text", limit=5):
+                parsed, _candidate_meta = ToolArgParser.parse_and_normalize("terminal_send_text", obj)
+                if isinstance(parsed, dict) and str(parsed.get("text") or "").strip():
+                    add(parsed.get("text"), f"{source_name}:object", parsed.get("newline") if "newline" in parsed else None)
+            for block in re.findall(r"```(?:bash|sh|shell|console)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+                add(block, f"{source_name}:fenced", True)
+            for match in re.finditer(r"(?im)^\s*(?:COMMAND|cmd|run|execute)\s*[:=]\s*(.+)$", text):
+                add(match.group(1), f"{source_name}:command_line", True)
+            bare_command = cls._extract_bare_terminal_command_from_inline_tail(text)
+            if bare_command:
+                add(bare_command, f"{source_name}:inline_tail", True)
+
+        return [item for item in candidates if cls._looks_like_shell_command_text(str(item.get("text") or ""))]
+
+    async def _repair_tool_args_before_execution(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        raw_args: Any,
+        tc: Dict[str, Any],
+        parse_meta: Dict[str, Any],
+        step: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if name != "terminal_send_text" or str(args.get("text") or "").strip():
+            return args, parse_meta
+        call_id = str(tc.get("id") or "")
+        recovery_meta = self.tool_call_recovery_meta.get(call_id, {})
+        candidates = self._recover_terminal_send_text_candidates(recovery_meta, raw_args)
+        if len(candidates) != 1:
+            if candidates:
+                parse_meta.setdefault("parse_notes", []).append(f"terminal_send_text text recovery ambiguous: {len(candidates)} candidates")
+            return args, parse_meta
+        repaired = dict(args)
+        candidate = candidates[0]
+        repaired["text"] = str(candidate["text"])
+        newline_sources = str(
+            recovery_meta.get("raw_inline_args")
+            if isinstance(recovery_meta, dict) and recovery_meta.get("raw_inline_args") is not None
+            else raw_args
+        )
+        explicit_newline = bool(re.search(r"\b(newline|enter|press_enter|submit|return)\b", newline_sources))
+        if "newline" in candidate and (not explicit_newline or "newline" not in repaired):
+            repaired["newline"] = bool(candidate["newline"])
+        if not explicit_newline and recovery_meta.get("recovered_from") in {"missing closing tag", "missing argument object"}:
+            repaired["newline"] = True
+        parse_meta.setdefault("parse_notes", []).append(f"recovered missing terminal_send_text.text from {candidate.get('source')}")
+        await self.emit_llm("tool_call_repaired", {
+            "step": step,
+            "tool_name": name,
+            "repair": "missing_text_recovered",
+            "tool_call_id": call_id,
+            "source": candidate.get("source"),
+            "text_preview": repaired["text"][:300],
+            "newline": repaired.get("newline"),
+            "recovery_meta": recovery_meta,
+        })
+        return repaired, parse_meta
+
     async def _execute_tool_call(self, tc: Dict[str, Any], step: int) -> List[Dict[str, Any]]:
         fn = tc.get("function") or {}
         name = str(fn.get("name") or "")
         raw_args = fn.get("arguments") or "{}"
         args, parse_meta = ToolArgParser.parse_and_normalize(name, raw_args)
+        args, parse_meta = await self._repair_tool_args_before_execution(name, args, raw_args, tc, parse_meta, step)
         discipline_events: List[Dict[str, Any]] = []
         if name not in TOOL_ALLOWED_ARGS:
             discipline_events.append(self._tool_discipline_event(
                 kind="unknown_tool",
                 tool_name=name or "unknown_tool",
                 violation=f"You attempted to call an unknown tool: {name or '<empty>'}.",
-                correction="Use only one of the declared native tools from the system tool list, with a valid JSON argument object.",
+                correction="Use only one of the declared tools from the system tool list, with a valid JSON argument object.",
                 details={"raw_arguments": raw_args},
             ))
         # FLM/Gemma tool templates sometimes arrive through the OpenAI-compatible
@@ -3577,7 +4009,7 @@ class TerminalAgent:
         # values. If the tolerant parser produced a valid schema-only argument
         # object, accept it silently. Penalizing benign repairs here can deadlock
         # the loop after finish_task: the task is actually finished, but the model
-        # receives negative feedback and tries to continue.
+        # receives corrective feedback and tries to continue.
         ignored_args = parse_meta.get("ignored_args") or {}
         if ignored_args:
             discipline_events.append(self._tool_discipline_event(
@@ -3667,6 +4099,28 @@ class TerminalAgent:
                         "recovery_hint": result.get("recovery_hint"),
                     },
                 ))
+            elif not bool(result.get("ok", True)) and result.get("error_code") == "missing_required_argument":
+                await self.emit_llm("tool_call_incomplete", {
+                    "step": step,
+                    "tool_name": name,
+                    "error": result.get("error"),
+                    "argument": result.get("argument"),
+                    "received_args": result.get("received_args"),
+                    "retryable": result.get("retryable"),
+                    "recovery_hint": result.get("recovery_hint"),
+                })
+                discipline_events.append(self._tool_discipline_event(
+                    kind="missing_required_argument",
+                    tool_name=name,
+                    violation=f"Required argument {result.get('argument') or '<unknown>'} was missing, so the tool could not execute the intended action.",
+                    correction="Re-issue the same intended action with a complete JSON argument object in the active tool mode. Do not use XML/HTML parameter tags; put command text in terminal_send_text.text.",
+                    details={
+                        "error": result.get("error"),
+                        "args": args,
+                        "received_args": result.get("received_args"),
+                        "recovery_hint": result.get("recovery_hint"),
+                    },
+                ))
             elif not bool(result.get("ok", True)):
                 discipline_events.append(self._tool_discipline_event(
                     kind="tool_result_error",
@@ -3699,7 +4153,7 @@ class TerminalAgent:
                 kind="tool_execution_exception",
                 tool_name=name,
                 violation="The tool execution raised an exception.",
-                correction="Do not repeat the same malformed call. Inspect the error and call the correct native tool with valid JSON arguments.",
+                correction="Do not repeat the same malformed call. Inspect the error and call the correct tool with valid JSON arguments.",
                 details={"error": repr(exc), "args": args},
             ))
             result_payload = {
@@ -3719,8 +4173,17 @@ class TerminalAgent:
                 self.tool_call_names[str(tc.get("id"))] = name
             self.messages.append({"role": "tool", "tool_call_id": tc.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             await self._finish_tool_execution_stream(tool_stream_id, step, name, ok=False, result=result)
-        if name == "finish_task":
+        if name == "finish_task" and bool(result.get("ok", False)):
             self.finished = True
+        elif name == "finish_task":
+            self.finished = False
+            await self.emit_llm("finish_task_rejected_not_finished", {
+                "step": step,
+                "error": result.get("error"),
+                "error_code": result.get("error_code"),
+                "recovery_hint": result.get("recovery_hint"),
+                "pending_verifications": result.get("pending_verifications"),
+            })
         return discipline_events
 
     async def _start_tool_execution_stream(self, step: int, tool_call_id: Any, name: str) -> str:
@@ -3788,6 +4251,8 @@ class TerminalAgent:
     def _should_auto_capture_terminal_after_tool(self, name: str, args: Dict[str, Any]) -> bool:
         # These tools can change or advance the terminal state. terminal_read already returns
         # terminal text, and finish_task should not delay completion.
+        if name == "terminal_send_text":
+            return bool(str(args.get("text") or "").strip())
         if name in {"terminal_send_text", "terminal_send_keys", "terminal_resize", "sleep"}:
             return True
         return False
@@ -4319,7 +4784,16 @@ class TerminalAgent:
 
             if name == "terminal_send_text":
                 if "text" not in args or args.get("text") is None or str(args.get("text")) == "":
-                    return {"ok": False, "error": "missing required argument: text", "received_args": args}
+                    return {
+                        "ok": False,
+                        "error": "missing required argument: text",
+                        "error_code": "missing_required_argument",
+                        "tool_name": name,
+                        "argument": "text",
+                        "received_args": args,
+                        "retryable": True,
+                        "recovery_hint": "terminal_send_text requires a complete JSON argument object with non-empty text, for example {\"session_id\":\"session_1\",\"text\":\"nmap -sV 192.168.0.32\",\"newline\":true}. If the command is not ready, call terminal_list_sessions or terminal_read instead.",
+                    }
                 session, meta = self._target_session_for_tool(args, auto_create_if_busy=True)
                 if not session:
                     return meta
@@ -4646,8 +5120,8 @@ HTML = r"""
       if (ev === 'empty_retry') return `EMPTY RETRY step=${d.step}: the model returned an empty response without tool_calls`;
       if (ev === 'thinking_only_retry') return `THINKING-ONLY RETRY step=${d.step}: the model reasoned privately but returned no tool_calls`;
       if (ev === 'fake_tool_calls_recovered') return `WARNING step=${d.step}: Model returned fake tool_calls in content, recovered via fallback parser (${d.recovered_tool_calls_count || 0})`;
-      if (ev === 'tool_discipline_feedback') return `TOOL DISCIPLINE step=${d.step}: negative feedback sent to model for ${d.count || 0} bad tool-call issue(s)`;
-      if (ev === 'malformed_fake_tool_call_retry') return `TOOL DISCIPLINE RETRY step=${d.step}: malformed textual tool_calls; negative feedback sent and retry requested`;
+      if (ev === 'tool_discipline_feedback') return `TOOL FEEDBACK step=${d.step}: corrective feedback sent for ${d.count || 0} tool-call issue(s)`;
+      if (ev === 'malformed_fake_tool_call_retry') return `TOOL RETRY step=${d.step}: malformed textual tool_calls; corrective feedback sent and retry requested`;
       if (ev === 'llm_transient_error_retry') return `LLM TRANSIENT ERROR RETRY step=${d.step}: ${d.error || ''} remaining=${d.remaining}`;
       if (ev === 'llm_transient_error_exhausted') return `LLM TRANSIENT ERROR EXHAUSTED step=${d.step}: ${d.error || ''}`;
       if (ev === 'tool_choice_retry') return `TOOL_CHOICE RETRY: backend rejected required, retrying with auto`;

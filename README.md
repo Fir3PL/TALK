@@ -177,7 +177,8 @@ options:
   --no-think            Shortcut that sets --reasoning-effort none.
   --think               Kept for compatibility; thinking is high by default
                         anyway.
-  --log-dir LOG_DIR```
+  --log-dir LOG_DIR
+```
 
 ### Native Ollama backend
 

@@ -84,6 +84,7 @@ http://127.0.0.1:8000
 ```
 
 ### HELP
+```
 usage: talk.py [-h] [--api-provider {openai,ollama}]
                  [--base-url BASE_URL] [--api-key API_KEY] [--model MODEL]
                  [--host HOST] [--port PORT] [--shell SHELL] [--cwd CWD]
@@ -176,7 +177,7 @@ options:
   --no-think            Shortcut that sets --reasoning-effort none.
   --think               Kept for compatibility; thinking is high by default
                         anyway.
-  --log-dir LOG_DIR
+  --log-dir LOG_DIR```
 
 ### Native Ollama backend
 

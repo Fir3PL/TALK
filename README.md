@@ -83,6 +83,101 @@ Open the web UI:
 http://127.0.0.1:8000
 ```
 
+### HELP
+usage: talk.py [-h] [--api-provider {openai,ollama}]
+                 [--base-url BASE_URL] [--api-key API_KEY] [--model MODEL]
+                 [--host HOST] [--port PORT] [--shell SHELL] [--cwd CWD]
+                 [--prompt PROMPT] [--temperature TEMPERATURE]
+                 [--max-steps MAX_STEPS]
+                 [--tool-choice {required,auto,none,omit}]
+                 [--flm-tools-mode {auto,native,inline}]
+                 [--empty-retries EMPTY_RETRIES]
+                 [--llm-error-retries LLM_ERROR_RETRIES]
+                 [--terminal-context-chars TERMINAL_CONTEXT_CHARS]
+                 [--terminal-tool-delay-ms TERMINAL_TOOL_DELAY_MS]
+                 [--memory-enabled | --no-memory-enabled]
+                 [--memory-max-items MEMORY_MAX_ITEMS]
+                 [--memory-context-items MEMORY_CONTEXT_ITEMS]
+                 [--max-request-chars MAX_REQUEST_CHARS]
+                 [--compact-keep-recent-messages COMPACT_KEEP_RECENT_MESSAGES]
+                 [--compact-tool-result-chars COMPACT_TOOL_RESULT_CHARS]
+                 [--reasoning-effort {none,low,medium,high}] [--no-think]
+                 [--think] [--log-dir LOG_DIR]
+
+TALK — Terminal Agent Linux Kit: a single-file terminal agent for
+FastFlowLM, OpenAI-compatible APIs, and native Ollama
+
+options:
+  -h, --help            show this help message and exit
+  --api-provider {openai,ollama}
+                        openai = OpenAI-compatible /v1 chat completions;
+                        ollama = native Ollama /api/chat.
+  --base-url BASE_URL   OpenAI-compatible base URL or Ollama host/API URL.
+                        Defaults depend on --api-provider.
+  --api-key API_KEY     API key. For local native Ollama this can be empty;
+                        for ollama.com use OLLAMA_API_KEY.
+  --model MODEL
+  --host HOST
+  --port PORT
+  --shell SHELL
+  --cwd CWD
+  --prompt PROMPT       Startup prompt; if omitted, provide it in the UI
+  --temperature TEMPERATURE
+  --max-steps MAX_STEPS
+  --tool-choice {required,auto,none,omit}
+                        Defaults to required so the model does not end the
+                        loop with an empty response without tool_calls. Use
+                        auto/omit if the backend rejects required.
+  --flm-tools-mode {auto,native,inline}
+                        For FastFlowLM OpenAI-compatible streaming: native
+                        sends OpenAI tools; inline omits backend tools and
+                        lets TALK parse <|tool_call> blocks itself; auto
+                        enables inline for common local FLM/gemma4-it
+                        setups.
+  --empty-retries EMPTY_RETRIES
+                        How many times to retry when the model returns an
+                        empty response without tool_calls. Also used as the
+                        retry budget for thinking-only responses without
+                        tool_calls, with a minimum of one thinking-only
+                        retry.
+  --llm-error-retries LLM_ERROR_RETRIES
+                        How many times to retry transient LLM
+                        transport/backend errors such as ReadTimeout before
+                        stopping the current run without marking the task
+                        complete.
+  --terminal-context-chars TERMINAL_CONTEXT_CHARS
+                        How many trailing terminal characters to attach to
+                        each LLM request.
+  --terminal-tool-delay-ms TERMINAL_TOOL_DELAY_MS
+                        Delay before automatically attaching fresh terminal
+                        output after terminal-changing tools.
+  --memory-enabled, --no-memory-enabled
+                        Enable small session RAG memory tools and automatic
+                        memory context injection.
+  --memory-max-items MEMORY_MAX_ITEMS
+                        Maximum number of facts kept in session memory.
+  --memory-context-items MEMORY_CONTEXT_ITEMS
+                        How many relevant memory items to attach
+                        automatically to each LLM request.
+  --max-request-chars MAX_REQUEST_CHARS
+                        Approximate character budget for the full request
+                        sent to the LLM; older history is compacted when
+                        this is exceeded.
+  --compact-keep-recent-messages COMPACT_KEEP_RECENT_MESSAGES
+                        How many newest conversation messages to keep
+                        verbatim before inserting a compacted-history
+                        summary.
+  --compact-tool-result-chars COMPACT_TOOL_RESULT_CHARS
+                        Maximum size of large strings inside tool results
+                        in the request copy sent to the LLM.
+  --reasoning-effort {none,low,medium,high}
+                        Controls thinking/reasoning. Defaults to high, the
+                        maximum thinking mode in FastFlowLM.
+  --no-think            Shortcut that sets --reasoning-effort none.
+  --think               Kept for compatibility; thinking is high by default
+                        anyway.
+  --log-dir LOG_DIR
+
 ### Native Ollama backend
 
 Start Ollama and pull a model:
